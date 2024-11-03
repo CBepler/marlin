@@ -44,23 +44,24 @@ using I4 = Vec<int, 4>;
 
 // Matrix fragments for tensor core instructions; their precise layout is documented here: 
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#matrix-fragments-for-mma-m16n8k16-with-floating-point-type
-using FragA = Vec<half2, 4>;
+using FragA = Vec<half2, 4>; //vector of 4 half2 (pair of half precision floating point values)
 using FragB = Vec<half2, 2>;
-using FragC = Vec<float, 4>;
+using FragC = Vec<float, 4>; //vector of 4 floats
 using FragS = Vec<half2, 1>; // quantization scales
 
 // Predicated asynchronous global->shared copy; used for inputs A where we apply predication to handle batchsizes that
 // are not multiples of 16.
+//if the batch size is not a multiple of 16, padding must be added and then predication is used so global -> shared memory instructions are not wasted on padding
 __device__ inline void cp_async4_pred(void* smem_ptr, const void* glob_ptr, bool pred = true) {
   const int BYTES = 16;
-  uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));  //void* is a 64 bit generic pointer divided up to [Memory Space ID | 48 bit offset] converted to shared memory address for PTX -> [32 bit offset into shared memory]
   asm volatile(
     "{\n"
     "   .reg .pred p;\n"
-    "   setp.ne.b32 p, %0, 0;\n"
-    "   @p cp.async.cg.shared.global [%1], [%2], %3;\n"
+    "   setp.ne.b32 p, %0, 0;\n" //checking predicate is non-zero for true
+    "   @p cp.async.cg.shared.global [%1], [%2], %3;\n"  //@p (only execute if predicate is true)     cp.async.cg.shared.global (copy.asynchronous.cache_global(store in L2 not L1).global to shared)
     "}\n" :: "r"((int) pred), "r"(smem), "l"(glob_ptr), "n"(BYTES)
-  );
+  );            //%0            %1        %2              %3
 }
 
 // Asynchronous global->shared copy with a cache hint indicating that the values may be evicted immediately; used for
@@ -72,7 +73,7 @@ __device__ inline void cp_async4_stream(void* smem_ptr, const void* glob_ptr) {
   asm volatile(
     "{\n"
     "   .reg .b64 p;\n"
-    "   createpolicy.fractional.L2::evict_first.b64 p, 1.0;"
+    "   createpolicy.fractional.L2::evict_first.b64 p, 1.0;" //cache hint to evict first since it will not be reused
     "   cp.async.cg.shared.global.L2::cache_hint [%0], [%1], %2, p;\n"
     "}\n" :: "r"(smem), "l"(glob_ptr), "n"(BYTES)
   );
@@ -80,13 +81,13 @@ __device__ inline void cp_async4_stream(void* smem_ptr, const void* glob_ptr) {
 
 // Async copy fence.
 __device__ inline void cp_async_fence() {
-  asm volatile("cp.async.commit_group;\n" ::);
+  asm volatile("cp.async.commit_group;\n" ::); //fence that outlines copying groups
 }
 
 // Wait until at most `n` async copy stages are still pending.
 template <int n>
 __device__ inline void cp_async_wait() {
-  asm volatile("cp.async.wait_group %0;\n" :: "n"(n));
+  asm volatile("cp.async.wait_group %0;\n" :: "n"(n)); //uses the copying groups and says to block execution until only 'n' groups are still executing or queued
 }
 
 // m16n8k16 tensor core mma instruction with fp16 inputs and fp32 output/accumulation.
@@ -95,28 +96,29 @@ __device__ inline void mma(const FragA& a_frag, const FragB& frag_b, FragC& frag
   const uint32_t* b = reinterpret_cast<const uint32_t*>(&frag_b);
   float* c = reinterpret_cast<float*>(&frag_c);
   asm volatile(
-    "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+    "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "  //matrix-multiply-accumulate.synchronize threads.use aligned memory.matrix size(output is 16x8 and the shared dimension of the inputs is 16 so says matrices are (16x16)x(16x8)=(16x8)).input in row major.output in column major.input output type (fp32).input A type (fp16).input B type (fp16).accumulator type (fp32)
     "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
     : "=f"(c[0]), "=f"(c[1]), "=f"(c[2]), "=f"(c[3])
     :  "r"(a[0]),  "r"(a[1]),  "r"(a[2]),  "r"(a[3]),  "r"(b[0]),  "r"(b[1]),
-       "f"(c[0]),  "f"(c[1]),  "f"(c[2]),  "f"(c[3])
+       "f"(c[0]),  "f"(c[1]),  "f"(c[2]),  "f"(c[3]) //giving values for A, B, accumulator, and output location. Remember 32 threads in warp are working together to do this. So 1 thread gives 4 value of A which is 8 fp16 value * 32 threads = 256 values which is full 16x16 A matrix fragment. Same applies for B and C
   );
 }
 
 // Instruction for loading a full 16x16 matrix fragment of operand A from shared memory, directly in tensor core layout.
+//shared memory -> thread registers
 __device__ inline void ldsm4(FragA& frag_a, const void* smem_ptr) {
   uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
   uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   asm volatile(
-    "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-    : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(smem)
+    "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n" //load matrix.synchronize threads.aligned memory.8x8 matrix tile size.load 4 tiles.load from shard memory.16 bit elements
+    : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(smem) //first 4 are thread registers and last is location in shared memory (again remember 32 threads working together (4 * 2 * 32 = 256))
   );
 }
 
 // Lookup-table based 3-input logical operation; explicitly used for dequantization as the compiler does not seem to
 // automatically recognize it in all cases. 
-template <int lut>
-__device__ inline int lop3(int a, int b, int c) {
+template <int lut> //LUT is an 8-bit value that defines the logic operations
+__device__ inline int lop3(int a, int b, int c) {  //the lop3 command allows 3 bitwise operations on a, b, c to be done in 1 instruction
   int res;
   asm volatile(
     "lop3.b32 %0, %1, %2, %3, %4;\n"
@@ -128,60 +130,71 @@ __device__ inline int lop3(int a, int b, int c) {
 // Efficiently dequantize an int32 value into a full B-fragment of 4 fp16 values.
 // We mostly follow the strategy in the link below, with some small changes:
 // https://github.com/NVIDIA/FasterTransformer/blob/main/src/fastertransformer/cutlass_extensions/include/cutlass_extensions/interleaved_numeric_conversion.h
-__device__ inline FragB dequant(int q) {
+__device__ inline FragB dequant(int q) { //q contains 8 4 bit integer values 
   const int LO = 0x000f000f;
-  const int HI = 0x00f000f0;
-  const int EX = 0x64006400;
+  const int HI = 0x00f000f0; //From LO and HI you can observe that 4 4 bit value will be extracted from the total 8. This is so that all warps can participate, 4 * 32 = 128 which is the total size of the chunk of B.
+  //The extracting 4 values is also what allows us to use EX for the other 16 bits
+  const int EX = 0x64006400; // or with EX in the LOP3 stage. This to fp16 values that each start with 0110 0100 which will translate to 1 * 2^10. And then with the int values or'd into the lower 8 bits, we get 1 * 2^10 + int
   // Guarantee that the `(a & b) | c` operations are LOP3s.
-  int lo = lop3<(0xf0 & 0xcc) | 0xaa>(q, LO, EX);
+  int lo = lop3<(0xf0 & 0xcc) | 0xaa>(q, LO, EX); 
   int hi = lop3<(0xf0 & 0xcc) | 0xaa>(q, HI, EX);
+  //we now have 2 fp16 values in each of LO and HI centered around 1024 (2^10)
   // We want signed int4 outputs, hence we fuse the `-8` symmetric zero point directly into `SUB` and `ADD`.
-  const int SUB = 0x64086408;
+  const int SUB = 0x64086408; // 1 * 2^10 + 8 = 1024 + 8 = 1032
   const int MUL = 0x2c002c00;
   const int ADD = 0xd480d480;
   FragB frag_b;
-  frag_b[0] = __hsub2(
+  frag_b[0] = __hsub2( //half2 sub built in
     *reinterpret_cast<half2*>(&lo),
-    *reinterpret_cast<const half2*>(&SUB)
+    *reinterpret_cast<const half2*>(&SUB) //subtract each fp16 by 1032 to center around 0
   );
-  frag_b[1] = __hfma2(
+  frag_b[1] = __hfma2( //half2 fused multiply add (a * b) + c
     *reinterpret_cast<half2*>(&hi),
     *reinterpret_cast<const half2*>(&MUL), *reinterpret_cast<const half2*>(&ADD)
-  );
+  ); //ceters each fp16 around 0 (requires the fused multiply add because they were stored in the upper 4 bits of the mantissa)
   return frag_b;
-}
+} //overall function convert 4 4 bit values to fp16 and center them around 0 by subtracting 8 from each and then store result in a frag_b
 
 // Multiply dequantized values by the corresponding quantization scale; used only for grouped quantization.
-__device__ inline void scale(FragB& frag_b, FragS& frag_s, int i) {
-  half2 s = __half2half2(reinterpret_cast<__half*>(&frag_s)[i]);
-  frag_b[0] = __hmul2(frag_b[0], s);
-  frag_b[1] = __hmul2(frag_b[1], s);
+__device__ inline void scale(FragB& frag_b, FragS& frag_s, int i) { //4 dequantized fp16 valued in 2 half2s, quantization scales, which scale to use
+  half2 s = __half2half2(reinterpret_cast<__half*>(&frag_s)[i]); //convert single fp16 scale to half2 (duplicate scale value) [scale | scale]
+  frag_b[0] = __hmul2(frag_b[0], s); //multiply each pair of dequantized values by the scale [val1 * scale | val2 * scale]
+  frag_b[1] = __hmul2(frag_b[1], s); // [val3 * scale | val4 * scale]
 }
+/*
+  In quanitzation, groups of values of size 'group size' in the orignal weight matrix (fp16) are formed and then a scale is selected for that group. 
+  This scale value does the best job of bringing all weights in the group to a whole integer value that can be stored in int4.
+  Then the scale value is saved in the S array to be used for dequantization to bring the weights back.
+  Group size is selected to balance the memory load of an additional scale array with the ability of 1 value to accurately scale 'group size' values
+*/
 
 // Wait until barrier reaches `count`, then lock for current threadblock.
+//This ensures that all blocks that need the section of B that is in L2 cache right now get it before it is evicted
+//This is why we know sections of B will only be brought in once
 __device__ inline void barrier_acquire(int* lock, int count) {
-  if (threadIdx.x == 0) {
+  if (threadIdx.x == 0) { //only thread 0 in each block does checking
     int state = -1;
     do
       // Guarantee that subsequent writes by this threadblock will be visible globally.
-      asm volatile ("ld.global.acquire.gpu.b32 %0, [%1];\n" : "=r"(state) : "l"(lock));
+      asm volatile ("ld.global.acquire.gpu.b32 %0, [%1];\n" : "=r"(state) : "l"(lock)); //load.from global memory.memory barrier to prevent loads from being reordered before it.gpu.32 bits into %0 (state) from [%1] (thing at address in lock)
+      //loops until all the blocks needed have made it here
     while (state != count);
   }
-  __syncthreads();
+  __syncthreads(); //blocks all non-thread 0 threads in block to wait for thread 0
 }
 
 // Release barrier and increment visitation count.
 __device__ inline void barrier_release(int* lock, bool reset = false) {
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    if (reset) {
+  __syncthreads(); //ensure all threads have arrived and no further writes happen
+  if (threadIdx.x == 0) { //only thread 0
+    if (reset) { //resets the lock allowing for reuse
       lock[0] = 0;
       return;
     }
     int val = 1;
     // Make sure that all writes since acquiring this barrier are visible globally, while releasing the barrier. 
-    asm volatile ("fence.acq_rel.gpu;\n");
-    asm volatile ("red.relaxed.gpu.global.add.s32 [%0], %1;\n" : : "l"(lock), "r"(val)); 
+    asm volatile ("fence.acq_rel.gpu;\n"); // memory barrier.ensure all previous memory writes are visible globally.gpu    Ensures all blocks are synchronized on lock value before updating
+    asm volatile ("red.relaxed.gpu.global.add.s32 [%0], %1;\n" : : "l"(lock), "r"(val)); //reduction (atomic add).relaxed memory ordering.gpu.global memory operation.add.32 bit integer [%0] destination (address at lock) %1 value to add (val = 1 (increment))
   }
 }
 
