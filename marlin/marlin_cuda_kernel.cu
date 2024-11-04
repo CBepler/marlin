@@ -205,9 +205,9 @@ template <
   const int thread_n_blocks, // same for n dimension (output) 
   const int thread_k_blocks, // same for k dimension (reduction)
   const int stages, // number of stages for the async global->shared fetch pipeline
-  const int group_blocks = -1 // number of consecutive 16x16 blocks with a separate quantization scale
+  const int group_blocks = -1 // number of consecutive 16x16 blocks with a separate quantization scale (share the same quantization value)
 >
-__global__ void Marlin(
+__global__ void Marlin( //NOTE: A,B,C,S are packed into int4 types which are vectors of 4 32 bit integers
   const int4* __restrict__ A, // fp16 input matrix of shape mxk 
   const int4* __restrict__ B, // 4bit quantized weight matrix of shape kxn 
         int4* __restrict__ C, // fp16 output buffer of shape mxn
@@ -229,15 +229,15 @@ __global__ void Marlin(
   // For larger GEMMs we run multiple batchsize 64 versions in parallel for a better partitioning with less reductions
   int parallel = 1;
   if (prob_m > 16 * thread_m_blocks) {
-    parallel = prob_m / (16 * thread_m_blocks);
+    parallel = prob_m / (16 * thread_m_blocks); //number of thread_block workloads in m dimension
     prob_m = 16 * thread_m_blocks;
   }
 
-  int k_tiles = prob_k / 16 / thread_k_blocks;
-  int n_tiles = prob_n / 16 / thread_n_blocks;
-  int iters = ceildiv(k_tiles * n_tiles * parallel, gridDim.x);
+  int k_tiles = prob_k / 16 / thread_k_blocks;  //number of thread_block workloads in k dimension
+  int n_tiles = prob_n / 16 / thread_n_blocks;  //number of thread_block workloads in n dimension
+  int iters = ceildiv(k_tiles * n_tiles * parallel, gridDim.x);  // (total number of thread_block workloads) / (number of blocks in grid) = number of iterations per block
   // Ensure that the number of tiles in each stripe is a multiple of the groupsize; this avoids an annoying special case
-  // where a stripe starts in the middle of group.
+  // where a stripe starts in the middle of group. Ensures all blocks in group belong to same thread block
   if (group_blocks != -1)
     iters = (group_blocks / thread_k_blocks) * ceildiv(iters, (group_blocks / thread_k_blocks));
 
@@ -257,6 +257,9 @@ __global__ void Marlin(
   }
 
   // Compute all information about the current slice which is required for synchronization.
+  //slice_iters: How many iteratiosn of work this threadblock needs to do in its current slice
+  //slice_count: How many threadblocks total are working on this same slice
+  //slice_idx the threadblock's position among those working on the slice
   auto init_slice = [&] () {
     slice_iters = iters * (blockIdx.x + 1) - (k_tiles * slice_col_par + slice_row);
     if (slice_iters < 0 || slice_col_par >= n_tiles * parallel)
@@ -291,7 +294,7 @@ __global__ void Marlin(
   };
   init_slice();
 
-  int a_gl_stride = prob_k / 8; // stride of the A matrix in global memory
+  int a_gl_stride = prob_k / 8; // stride of the A matrix in global memory    int4 -> 4 * 32 = 128 bits -> 8 * 16 -> 8 fp16 values hence prob_k / 8
   // We typically use `constexpr` to indicate that this value is a compile-time constant
   constexpr int a_sh_stride = 16 * thread_k_blocks / 8; // stride of an A matrix tile in shared memory
   constexpr int a_gl_rd_delta_o = 16 * thread_k_blocks / 8; // delta between subsequent A tiles in global memory
@@ -302,7 +305,7 @@ __global__ void Marlin(
   constexpr int a_sh_stage = a_sh_stride * (16 * thread_m_blocks); // overall size of a tile
   constexpr int a_sh_wr_iters = ceildiv(a_sh_stage, a_sh_wr_delta); // number of shared write iterations for a tile
 
-  int b_gl_stride = 16 * prob_n / 32;
+  int b_gl_stride = 16 * prob_n / 32;   //16 * prob_n = total 4-bit values in 16 rows across n columns. (16 * prob_n) / 32 = number of int4s needed to store these values
   constexpr int b_sh_stride = 32 * thread_n_blocks / 4;
   int b_gl_rd_delta_o = b_gl_stride * thread_k_blocks;
   int b_gl_rd_delta_i = b_gl_stride * (threads / b_sh_stride);
