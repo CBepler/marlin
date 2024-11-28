@@ -135,18 +135,20 @@ __device__ inline FragB2 dequant(int q) {
   const int MIDLO = 0x000C000C;
   const int MIDHI = 0x00300030;
   const int HI = 0x00C000C0;
-  const int EX = 0x42004200;
+  const int EX = 0x44804480;  //bias of 127:  137 - 127 = 10
   // Guarantee that the `(a & b) | c` operations are LOP3s.
   int lo = lop3<(0xf0 & 0xcc) | 0xaa>(q, LO, EX);
   int midLo = lop3<(0xf0 & 0xcc) | 0xaa>(q, MIDLO, EX);
   int midHi = lop3<(0xf0 & 0xcc) | 0xaa>(q, MIDHI, EX);
   int hi = lop3<(0xf0 & 0xcc) | 0xaa>(q, HI, EX);
-  // We want signed int4 outputs, hence we fuse the `-8` symmetric zero point directly into `SUB` and `ADD`.
-  const int SUB = 0x64086408;
-  const int MULLO = 0x34003400;   //2 bit shift
-  const int MULMID = 0x2c002c00;  //4 bit shift
-  const int MULHI = 0x24002400; //6 bit shift
-  const int ADD = 0xd480d480;
+  // We want signed int2 outputs, hence we fuse the `-2` symmetric zero point directly into `SUB` and `ADD`.
+  const int SUB = 0x44804480;    //1024 (1024 + 2 = 1026 is impossible to represent in bf16)
+  const int MULLO = 0x3E803E80;   //2 bit shift
+  const int MULMID = 0x3D803D80;  //4 bit shift
+  const int MULHI = 0x3C803C80; //6 bit shift
+  const int ADDLO = 0xC381C381;   //-258
+  const int ADDMID = 0xC284C284;  //-66 
+  const int ADDHI = 0xC190C190;   //-18
   FragB2 frag_b;
   frag_b[0][0] = __hsub2_rn(
     *reinterpret_cast<__nv_bfloat162*>(&lo),
@@ -154,15 +156,15 @@ __device__ inline FragB2 dequant(int q) {
   );
   frag_b[0][1] = __hfma2(
     *reinterpret_cast<__nv_bfloat162*>(&midLo),
-    *reinterpret_cast<const __nv_bfloat162*>(&MULLO), *reinterpret_cast<const __nv_bfloat162*>(&ADD)
+    *reinterpret_cast<const __nv_bfloat162*>(&MULLO), *reinterpret_cast<const __nv_bfloat162*>(&ADDLO)
   );
   frag_b[1][0] = __hfma2(
     *reinterpret_cast<__nv_bfloat162*>(&midHi),
-    *reinterpret_cast<const __nv_bfloat162*>(&MULMID), *reinterpret_cast<const __nv_bfloat162*>(&ADD)
+    *reinterpret_cast<const __nv_bfloat162*>(&MULMID), *reinterpret_cast<const __nv_bfloat162*>(&ADDMID)
   );
   frag_b[1][1] = __hfma2(
     *reinterpret_cast<__nv_bfloat162*>(&hi),
-    *reinterpret_cast<const __nv_bfloat162*>(&MULHI), *reinterpret_cast<const __nv_bfloat162*>(&ADD)
+    *reinterpret_cast<const __nv_bfloat162*>(&MULHI), *reinterpret_cast<const __nv_bfloat162*>(&ADDHI)
   );
   return frag_b;
 }
