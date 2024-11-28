@@ -143,9 +143,9 @@ __device__ inline FragB2 dequant(int q) {
   int hi = lop3<(0xf0 & 0xcc) | 0xaa>(q, HI, EX);
   // We want signed int2 outputs, hence we fuse the `-2` symmetric zero point directly into `SUB` and `ADD`.
   const int SUB = 0x44804480;    //1024 (1024 + 2 = 1026 is impossible to represent in bf16)
-  const int MULLO = 0x3E803E80;   //2 bit shift
-  const int MULMID = 0x3D803D80;  //4 bit shift
-  const int MULHI = 0x3C803C80; //6 bit shift
+  const int MULLO = 0x3E803E80;   //2 bit shift  (1024 / (2^2)) = 256
+  const int MULMID = 0x3D803D80;  //4 bit shift  (1024 / (2^4)) = 64
+  const int MULHI = 0x3C803C80; //6 bit shift    (1024 / (2^6)) = 16
   const int ADDLO = 0xC381C381;   //-258
   const int ADDMID = 0xC284C284;  //-66 
   const int ADDHI = 0xC190C190;   //-18
