@@ -21,6 +21,7 @@
 
 #include <cuda.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <iostream>
 
@@ -44,24 +45,24 @@ using I4 = Vec<int, 4>;
 
 // Matrix fragments for tensor core instructions; their precise layout is documented here: 
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#matrix-fragments-for-mma-m16n8k16-with-floating-point-type
-using FragA = Vec<half2, 4>; //vector of 4 half2 (pair of half precision floating point values)
-using FragB = Vec<half2, 2>;
-using FragC = Vec<float, 4>; //vector of 4 floats
-using FragS = Vec<half2, 1>; // quantization scales
+using FragA = Vec<__nv_bfloat162, 4>;
+using FragB = Vec<__nv_bfloat162, 2>;
+using FragB2 = Vec<FragB, 2>;
+using FragC = Vec<float, 4>;
+using FragS = Vec<__nv_bfloat162, 1>; // quantization scales
 
 // Predicated asynchronous global->shared copy; used for inputs A where we apply predication to handle batchsizes that
 // are not multiples of 16.
-//if the batch size is not a multiple of 16, padding must be added and then predication is used so global -> shared memory instructions are not wasted on padding
 __device__ inline void cp_async4_pred(void* smem_ptr, const void* glob_ptr, bool pred = true) {
   const int BYTES = 16;
-  uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));  //void* is a 64 bit generic pointer divided up to [Memory Space ID | 48 bit offset] converted to shared memory address for PTX -> [32 bit offset into shared memory]
+  uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   asm volatile(
     "{\n"
     "   .reg .pred p;\n"
-    "   setp.ne.b32 p, %0, 0;\n" //checking predicate is non-zero for true
-    "   @p cp.async.cg.shared.global [%1], [%2], %3;\n"  //@p (only execute if predicate is true)     cp.async.cg.shared.global (copy.asynchronous.cache_global(store in L2 not L1).global to shared)
+    "   setp.ne.b32 p, %0, 0;\n"
+    "   @p cp.async.cg.shared.global [%1], [%2], %3;\n"
     "}\n" :: "r"((int) pred), "r"(smem), "l"(glob_ptr), "n"(BYTES)
-  );            //%0            %1        %2              %3
+  );
 }
 
 // Asynchronous global->shared copy with a cache hint indicating that the values may be evicted immediately; used for
@@ -73,7 +74,7 @@ __device__ inline void cp_async4_stream(void* smem_ptr, const void* glob_ptr) {
   asm volatile(
     "{\n"
     "   .reg .b64 p;\n"
-    "   createpolicy.fractional.L2::evict_first.b64 p, 1.0;" //cache hint to evict first since it will not be reused
+    "   createpolicy.fractional.L2::evict_first.b64 p, 1.0;"
     "   cp.async.cg.shared.global.L2::cache_hint [%0], [%1], %2, p;\n"
     "}\n" :: "r"(smem), "l"(glob_ptr), "n"(BYTES)
   );
@@ -81,44 +82,43 @@ __device__ inline void cp_async4_stream(void* smem_ptr, const void* glob_ptr) {
 
 // Async copy fence.
 __device__ inline void cp_async_fence() {
-  asm volatile("cp.async.commit_group;\n" ::); //fence that outlines copying groups
+  asm volatile("cp.async.commit_group;\n" ::);
 }
 
 // Wait until at most `n` async copy stages are still pending.
 template <int n>
 __device__ inline void cp_async_wait() {
-  asm volatile("cp.async.wait_group %0;\n" :: "n"(n)); //uses the copying groups and says to block execution until only 'n' groups are still executing or queued
+  asm volatile("cp.async.wait_group %0;\n" :: "n"(n));
 }
 
-// m16n8k16 tensor core mma instruction with fp16 inputs and fp32 output/accumulation.
+// m16n8k16 tensor core mma instruction with bf16 inputs and fp32 output/accumulation.
 __device__ inline void mma(const FragA& a_frag, const FragB& frag_b, FragC& frag_c) {
   const uint32_t* a = reinterpret_cast<const uint32_t*>(&a_frag);
   const uint32_t* b = reinterpret_cast<const uint32_t*>(&frag_b);
   float* c = reinterpret_cast<float*>(&frag_c);
   asm volatile(
-    "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "  //matrix-multiply-accumulate.synchronize threads.use aligned memory.matrix size(output is 16x8 and the shared dimension of the inputs is 16 so says matrices are (16x16)x(16x8)=(16x8)).input in row major.output in column major.input output type (fp32).input A type (fp16).input B type (fp16).accumulator type (fp32)
+    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
     "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
     : "=f"(c[0]), "=f"(c[1]), "=f"(c[2]), "=f"(c[3])
     :  "r"(a[0]),  "r"(a[1]),  "r"(a[2]),  "r"(a[3]),  "r"(b[0]),  "r"(b[1]),
-       "f"(c[0]),  "f"(c[1]),  "f"(c[2]),  "f"(c[3]) //giving values for A, B, accumulator, and output location. Remember 32 threads in warp are working together to do this. So 1 thread gives 4 value of A which is 8 fp16 value * 32 threads = 256 values which is full 16x16 A matrix fragment. Same applies for B and C
+       "f"(c[0]),  "f"(c[1]),  "f"(c[2]),  "f"(c[3])
   );
 }
 
 // Instruction for loading a full 16x16 matrix fragment of operand A from shared memory, directly in tensor core layout.
-//shared memory -> thread registers
 __device__ inline void ldsm4(FragA& frag_a, const void* smem_ptr) {
   uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
   uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   asm volatile(
-    "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n" //load matrix.synchronize threads.aligned memory.8x8 matrix tile size.load 4 tiles.load from shard memory.16 bit elements
-    : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(smem) //first 4 are thread registers and last is location in shared memory (again remember 32 threads working together (4 * 2 * 32 = 256))
+    "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+    : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(smem)
   );
 }
 
 // Lookup-table based 3-input logical operation; explicitly used for dequantization as the compiler does not seem to
 // automatically recognize it in all cases. 
-template <int lut> //LUT is an 8-bit value that defines the logic operations
-__device__ inline int lop3(int a, int b, int c) {  //the lop3 command allows 3 bitwise operations on a, b, c to be done in 1 instruction
+template <int lut>
+__device__ inline int lop3(int a, int b, int c) {
   int res;
   asm volatile(
     "lop3.b32 %0, %1, %2, %3, %4;\n"
@@ -127,74 +127,77 @@ __device__ inline int lop3(int a, int b, int c) {  //the lop3 command allows 3 b
   return res;
 }
 
-// Efficiently dequantize an int32 value into a full B-fragment of 4 fp16 values.
+// Efficiently dequantize an int32 value into a full 2 B-fragments of 4 bf16 values.
 // We mostly follow the strategy in the link below, with some small changes:
 // https://github.com/NVIDIA/FasterTransformer/blob/main/src/fastertransformer/cutlass_extensions/include/cutlass_extensions/interleaved_numeric_conversion.h
-__device__ inline FragB dequant(int q) { //q contains 8 4 bit integer values 
-  const int LO = 0x000f000f;
-  const int HI = 0x00f000f0; //From LO and HI you can observe that 4 4 bit value will be extracted from the total 8. This is so that all warps can participate, 4 * 32 = 128 which is the total size of the chunk of B.
-  //The extracting 4 values is also what allows us to use EX for the other 16 bits
-  const int EX = 0x64006400; // or with EX in the LOP3 stage. This to fp16 values that each start with 0110 0100 which will translate to 1 * 2^10. And then with the int values or'd into the lower 8 bits, we get 1 * 2^10 + int
+__device__ inline FragB2 dequant(int q) {
+  const int LO = 0x00030003;
+  const int MIDLO = 0x000C000C;
+  const int MIDHI = 0x00300030;
+  const int HI = 0x00C000C0;
+  const int EX = 0x42004200;
   // Guarantee that the `(a & b) | c` operations are LOP3s.
-  int lo = lop3<(0xf0 & 0xcc) | 0xaa>(q, LO, EX); 
+  int lo = lop3<(0xf0 & 0xcc) | 0xaa>(q, LO, EX);
+  int midLo = lop3<(0xf0 & 0xcc) | 0xaa>(q, MIDLO, EX);
+  int midHi = lop3<(0xf0 & 0xcc) | 0xaa>(q, MIDHI, EX);
   int hi = lop3<(0xf0 & 0xcc) | 0xaa>(q, HI, EX);
-  //we now have 2 fp16 values in each of LO and HI centered around 1024 (2^10)
   // We want signed int4 outputs, hence we fuse the `-8` symmetric zero point directly into `SUB` and `ADD`.
-  const int SUB = 0x64086408; // 1 * 2^10 + 8 = 1024 + 8 = 1032
-  const int MUL = 0x2c002c00;
+  const int SUB = 0x64086408;
+  const int MULLO = 0x34003400;   //2 bit shift
+  const int MULMID = 0x2c002c00;  //4 bit shift
+  const int MULHI = 0x24002400; //6 bit shift
   const int ADD = 0xd480d480;
-  FragB frag_b;
-  frag_b[0] = __hsub2( //half2 sub built in
-    *reinterpret_cast<half2*>(&lo),
-    *reinterpret_cast<const half2*>(&SUB) //subtract each fp16 by 1032 to center around 0
+  FragB2 frag_b;
+  frag_b[0][0] = __hsub2_rn(
+    *reinterpret_cast<__nv_bfloat162*>(&lo),
+    *reinterpret_cast<const __nv_bfloat162*>(&SUB)
   );
-  frag_b[1] = __hfma2( //half2 fused multiply add (a * b) + c
-    *reinterpret_cast<half2*>(&hi),
-    *reinterpret_cast<const half2*>(&MUL), *reinterpret_cast<const half2*>(&ADD)
-  ); //ceters each fp16 around 0 (requires the fused multiply add because they were stored in the upper 4 bits of the mantissa)
+  frag_b[0][1] = __hfma2(
+    *reinterpret_cast<__nv_bfloat162*>(&midLo),
+    *reinterpret_cast<const __nv_bfloat162*>(&MULLO), *reinterpret_cast<const __nv_bfloat162*>(&ADD)
+  );
+  frag_b[1][0] = __hfma2(
+    *reinterpret_cast<__nv_bfloat162*>(&midHi),
+    *reinterpret_cast<const __nv_bfloat162*>(&MULMID), *reinterpret_cast<const __nv_bfloat162*>(&ADD)
+  );
+  frag_b[1][1] = __hfma2(
+    *reinterpret_cast<__nv_bfloat162*>(&hi),
+    *reinterpret_cast<const __nv_bfloat162*>(&MULHI), *reinterpret_cast<const __nv_bfloat162*>(&ADD)
+  );
   return frag_b;
-} //overall function convert 4 4 bit values to fp16 and center them around 0 by subtracting 8 from each and then store result in a frag_b
+}
 
 // Multiply dequantized values by the corresponding quantization scale; used only for grouped quantization.
-__device__ inline void scale(FragB& frag_b, FragS& frag_s, int i) { //4 dequantized fp16 valued in 2 half2s, quantization scales, which scale to use
-  half2 s = __half2half2(reinterpret_cast<__half*>(&frag_s)[i]); //convert single fp16 scale to half2 (duplicate scale value) [scale | scale]
-  frag_b[0] = __hmul2(frag_b[0], s); //multiply each pair of dequantized values by the scale [val1 * scale | val2 * scale]
-  frag_b[1] = __hmul2(frag_b[1], s); // [val3 * scale | val4 * scale]
+__device__ inline void scale(FragB& frag_b, FragS& frag_s, int i) {
+  __nv_bfloat162 s = __bfloat162bfloat162(reinterpret_cast<__nv_bfloat16*>(&frag_s)[i]);
+  frag_b[0] = __hmul2(frag_b[0], s);
+  frag_b[1] = __hmul2(frag_b[1], s);
 }
-/*
-  In quanitzation, groups of values of size 'group size' in the orignal weight matrix (fp16) are formed and then a scale is selected for that group. 
-  This scale value does the best job of bringing all weights in the group to a whole integer value that can be stored in int4.
-  Then the scale value is saved in the S array to be used for dequantization to bring the weights back.
-  Group size is selected to balance the memory load of an additional scale array with the ability of 1 value to accurately scale 'group size' values
-*/
 
 // Wait until barrier reaches `count`, then lock for current threadblock.
-//This ensures that all blocks that need the section of B that is in L2 cache right now get it before it is evicted
-//This is why we know sections of B will only be brought in once
 __device__ inline void barrier_acquire(int* lock, int count) {
-  if (threadIdx.x == 0) { //only thread 0 in each block does checking
+  if (threadIdx.x == 0) {
     int state = -1;
     do
       // Guarantee that subsequent writes by this threadblock will be visible globally.
-      asm volatile ("ld.global.acquire.gpu.b32 %0, [%1];\n" : "=r"(state) : "l"(lock)); //load.from global memory.memory barrier to prevent loads from being reordered before it.gpu.32 bits into %0 (state) from [%1] (thing at address in lock)
-      //loops until all the blocks needed have made it here
+      asm volatile ("ld.global.acquire.gpu.b32 %0, [%1];\n" : "=r"(state) : "l"(lock));
     while (state != count);
   }
-  __syncthreads(); //blocks all non-thread 0 threads in block to wait for thread 0
+  __syncthreads();
 }
 
 // Release barrier and increment visitation count.
 __device__ inline void barrier_release(int* lock, bool reset = false) {
-  __syncthreads(); //ensure all threads have arrived and no further writes happen
-  if (threadIdx.x == 0) { //only thread 0
-    if (reset) { //resets the lock allowing for reuse
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    if (reset) {
       lock[0] = 0;
       return;
     }
     int val = 1;
     // Make sure that all writes since acquiring this barrier are visible globally, while releasing the barrier. 
-    asm volatile ("fence.acq_rel.gpu;\n"); // memory barrier.ensure all previous memory writes are visible globally.gpu    Ensures all blocks are synchronized on lock value before updating
-    asm volatile ("red.relaxed.gpu.global.add.s32 [%0], %1;\n" : : "l"(lock), "r"(val)); //reduction (atomic add).relaxed memory ordering.gpu.global memory operation.add.32 bit integer [%0] destination (address at lock) %1 value to add (val = 1 (increment))
+    asm volatile ("fence.acq_rel.gpu;\n");
+    asm volatile ("red.relaxed.gpu.global.add.s32 [%0], %1;\n" : : "l"(lock), "r"(val)); 
   }
 }
 
@@ -205,9 +208,9 @@ template <
   const int thread_n_blocks, // same for n dimension (output) 
   const int thread_k_blocks, // same for k dimension (reduction)
   const int stages, // number of stages for the async global->shared fetch pipeline
-  const int group_blocks = -1 // number of consecutive 16x16 blocks with a separate quantization scale (share the same quantization value)
+  const int group_blocks = -1 // number of consecutive 16x16 blocks with a separate quantization scale
 >
-__global__ void Marlin( //NOTE: A,B,C,S are packed into int4 types which are vectors of 4 32 bit integers
+__global__ void Marlin(
   const int4* __restrict__ A, // fp16 input matrix of shape mxk 
   const int4* __restrict__ B, // 4bit quantized weight matrix of shape kxn 
         int4* __restrict__ C, // fp16 output buffer of shape mxn
@@ -229,15 +232,15 @@ __global__ void Marlin( //NOTE: A,B,C,S are packed into int4 types which are vec
   // For larger GEMMs we run multiple batchsize 64 versions in parallel for a better partitioning with less reductions
   int parallel = 1;
   if (prob_m > 16 * thread_m_blocks) {
-    parallel = prob_m / (16 * thread_m_blocks); //number of thread_block workloads in m dimension
+    parallel = prob_m / (16 * thread_m_blocks);
     prob_m = 16 * thread_m_blocks;
   }
 
-  int k_tiles = prob_k / 16 / thread_k_blocks;  //number of thread_block workloads in k dimension
-  int n_tiles = prob_n / 16 / thread_n_blocks;  //number of thread_block workloads in n dimension
-  int iters = ceildiv(k_tiles * n_tiles * parallel, gridDim.x);  // (total number of thread_block workloads) / (number of blocks in grid) = number of iterations per block
+  int k_tiles = prob_k / 16 / thread_k_blocks;
+  int n_tiles = prob_n / 16 / thread_n_blocks;
+  int iters = ceildiv(k_tiles * n_tiles * parallel, gridDim.x);
   // Ensure that the number of tiles in each stripe is a multiple of the groupsize; this avoids an annoying special case
-  // where a stripe starts in the middle of group. Ensures all blocks in group belong to same thread block
+  // where a stripe starts in the middle of group.
   if (group_blocks != -1)
     iters = (group_blocks / thread_k_blocks) * ceildiv(iters, (group_blocks / thread_k_blocks));
 
@@ -257,9 +260,6 @@ __global__ void Marlin( //NOTE: A,B,C,S are packed into int4 types which are vec
   }
 
   // Compute all information about the current slice which is required for synchronization.
-  //slice_iters: How many iteratiosn of work this threadblock needs to do in its current slice
-  //slice_count: How many threadblocks total are working on this same slice
-  //slice_idx the threadblock's position among those working on the slice
   auto init_slice = [&] () {
     slice_iters = iters * (blockIdx.x + 1) - (k_tiles * slice_col_par + slice_row);
     if (slice_iters < 0 || slice_col_par >= n_tiles * parallel)
@@ -294,7 +294,7 @@ __global__ void Marlin( //NOTE: A,B,C,S are packed into int4 types which are vec
   };
   init_slice();
 
-  int a_gl_stride = prob_k / 8; // stride of the A matrix in global memory    int4 -> 4 * 32 = 128 bits -> 8 * 16 -> 8 fp16 values hence prob_k / 8
+  int a_gl_stride = prob_k / 8; // stride of the A matrix in global memory
   // We typically use `constexpr` to indicate that this value is a compile-time constant
   constexpr int a_sh_stride = 16 * thread_k_blocks / 8; // stride of an A matrix tile in shared memory
   constexpr int a_gl_rd_delta_o = 16 * thread_k_blocks / 8; // delta between subsequent A tiles in global memory
@@ -305,8 +305,9 @@ __global__ void Marlin( //NOTE: A,B,C,S are packed into int4 types which are vec
   constexpr int a_sh_stage = a_sh_stride * (16 * thread_m_blocks); // overall size of a tile
   constexpr int a_sh_wr_iters = ceildiv(a_sh_stage, a_sh_wr_delta); // number of shared write iterations for a tile
 
-  int b_gl_stride = 16 * prob_n / 32;   //16 * prob_n = total 4-bit values in 16 rows across n columns. (16 * prob_n) / 32 = number of int4s needed to store these values
-  constexpr int b_sh_stride = 32 * thread_n_blocks / 4;
+  constexpr int numQuantValsPerint4 = 64;
+  int b_gl_stride = 16 * prob_n / numQuantValsPerint4;
+  constexpr int b_sh_stride = (16 * 16) * thread_n_blocks / numQuantValsPerint4;
   int b_gl_rd_delta_o = b_gl_stride * thread_k_blocks;
   int b_gl_rd_delta_i = b_gl_stride * (threads / b_sh_stride);
   constexpr int b_sh_wr_delta = threads;
@@ -458,20 +459,26 @@ __global__ void Marlin( //NOTE: A,B,C,S are packed into int4 types which are vec
   auto matmul = [&] (int k) {
     // We have the m dimension as the inner loop in order to encourage overlapping dequantization and matmul operations.
     #pragma unroll
-    for (int j = 0; j < 4; j++) {
+    for (int j = 0; j < 4; j = j + 2) {
       int b_quant = frag_b_quant[k % 2][j];
       int b_quant_shift = b_quant >> 8;
-      FragB frag_b0 = dequant(b_quant);
+      FragB2 frag_b0 = dequant(b_quant);
       // If there are no groups, we can just scale the final output once and can avoid doing so for each weight.
-      if (group_blocks != -1)
-        scale(frag_b0, frag_s[k % 2][j], 0);
-      FragB frag_b1 = dequant(b_quant_shift);
-      if (group_blocks != -1)
-        scale(frag_b1, frag_s[k % 2][j], 1);
+      if (group_blocks != -1){
+        scale(frag_b0[0], frag_s[k % 2][j], 0);
+	scale(frag_b0[1], frag_s[k % 2][j +1], 0);
+      }
+      FragB2 frag_b1 = dequant(b_quant_shift);
+      if (group_blocks != -1){
+        scale(frag_b1[0], frag_s[k % 2][j], 1);
+	scale(frag_b1[1], frag_s[k % 2][j + 1], 1);
+      }
       #pragma unroll
       for (int i = 0; i < thread_m_blocks; i++) {
-        mma(frag_a[k % 2][i], frag_b0, frag_c[i][j][0]);
-        mma(frag_a[k % 2][i], frag_b1, frag_c[i][j][1]);
+        mma(frag_a[k % 2][i], frag_b0[0], frag_c[i][j][0]);
+        mma(frag_a[k % 2][i], frag_b0[1], frag_c[i][j][1]);
+	mma(frag_a[k % 2][i], frag_b1[0], frag_c[i][j + 1][0]);
+	mma(frag_a[k % 2][i], frag_b1[1], frag_c[i][j + 1][1]);
       }
     }
   };
@@ -564,8 +571,8 @@ __global__ void Marlin( //NOTE: A,B,C,S are packed into int4 types which are vec
             int4 c_red = sh[c_sh_wr + i * c_sh_wr_delta];
             #pragma unroll
             for (int j = 0; j < 2 * 4; j++) {
-              reinterpret_cast<float*>(&frag_c)[4 * 2 * 4 * (i / 4) + 4 * j + (i % 4)] += __half2float(
-                reinterpret_cast<__half*>(&c_red)[j]
+              reinterpret_cast<float*>(&frag_c)[4 * 2 * 4 * (i / 4) + 4 * j + (i % 4)] += __bfloat162float(
+                reinterpret_cast<__nv_bfloat16*>(&c_red)[j]
               );
             }
           }
@@ -573,7 +580,7 @@ __global__ void Marlin( //NOTE: A,B,C,S are packed into int4 types which are vec
             int4 c;
             #pragma unroll
             for (int j = 0; j < 2 * 4; j++) {
-              reinterpret_cast<__half*>(&c)[j] = __float2half(
+              reinterpret_cast<__nv_bfloat16*>(&c)[j] = __float2bfloat16(
                 reinterpret_cast<float*>(&frag_c)[4 * 2 * 4 * (i / 4) + 4 * j + (i % 4)]
               );
             }
@@ -602,10 +609,10 @@ __global__ void Marlin( //NOTE: A,B,C,S are packed into int4 types which are vec
 
     // We first reorder in shared memory to guarantee the most efficient final global write patterns
     auto write = [&] (int idx, float c0, float c1, FragS& s) {
-      half2 res = __halves2half2(__float2half(c0), __float2half(c1));
+      __nv_bfloat162 res = __halves2bfloat162(__float2bfloat16(c0), __float2bfloat16(c1));
       if (group_blocks == -1) // for per-column quantization we finally apply the scale here
         res = __hmul2(res, s[0]);
-      ((half2*) sh)[idx] = res;
+      ((__nv_bfloat162*) sh)[idx] = res;
     };
     if (threadIdx.x / 32 < thread_n_blocks / 4) {
       #pragma unroll

@@ -25,11 +25,11 @@ def get_problem(m, n, k, groupsize=-1):
     if groupsize == -1:
         groupsize = k
     dev = torch.device('cuda:0')
-    A = torch.randn((m, k), dtype=torch.half, device=dev)
-    B = torch.randint(low=-2**31, high=2**31, size=(k * n // 8,), device=dev)
-    B_ref = torch.randn((k, n), dtype=torch.half, device=dev)
-    C = torch.zeros((m, n), dtype=torch.half, device=dev)
-    s = torch.zeros((k // groupsize, n), dtype=torch.half, device=dev)
+    A = torch.randn((m, k), dtype=torch.bfloat16, device=dev)
+    B = torch.randint(low=-2**31, high=2**31, size=(k * n // 16,), device=dev)
+    B_ref = torch.randn((k, n), dtype=torch.bfloat16, device=dev)
+    C = torch.zeros((m, n), dtype=torch.bfloat16, device=dev)
+    s = torch.zeros((k // groupsize, n), dtype=torch.bfloat16, device=dev)
     torch.cuda.synchronize()
     return A, B, C, B_ref, s
 
@@ -47,7 +47,7 @@ def benchmark_quant(A, B, C, s, thread_k, thread_n, sms):
     return {
         's': res,
         'TFLOP/s': 2 * A.numel() * C.shape[1] / res / 10 ** 12,
-        'GB/s': (2 * A.numel() + 4 * B.numel() + 2 * C.numel() + 2 * s.numel()) / res / 10 ** 9
+        'GB/s': (2 * A.numel() + 2 * B.numel() + 2 * C.numel() + 2 * s.numel()) / res / 10 ** 9
     }
 
 # Pass the SM count for known GPUs to avoid the kernel having to query this information (this is very minor)

@@ -6,7 +6,7 @@ setup(
     version='0.1.1',
     author='Elias Frantar',
     author_email='elias.frantar@ist.ac.at',
-    description='Highly optimized FP16xINT4 CUDA matmul kernel.',
+    description='Highly optimized BF16xINT2 CUDA matmul kernel.',
     install_requires=['numpy', 'torch'],
     packages=['marlin'],
     ext_modules=[cpp_extension.CUDAExtension(
