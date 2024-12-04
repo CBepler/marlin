@@ -134,7 +134,7 @@ class Layer(nn.Module):
         q = np.zeros((res.shape[0], res.shape[1] // 16), dtype=np.uint32) #16 values packed into each uint32
         res = res.cpu().numpy().astype(np.uint32)
         for i in range(16):
-            q |= res[:, i::16] << 2 * i  #grabs every 16th bit and then shifts by 2 for packing
+            q |= res[:, i::16] << 2 * i  #grabs every 16th bit and then shifts by 2 for packing  (verified)
         q = torch.from_numpy(q.astype(np.int32)).to(w.device)
         self.B[:, :] = q.to(self.B.device)
         self.s[:, :] = s.to(self.s.device)

@@ -19,20 +19,20 @@ def gen_quant2(m, n, groupsize=-1):
     maxq = 2 ** 2 - 1
     w = torch.randn((m, n), dtype=torch.bfloat16, device=DEV)
     if groupsize != -1:
-        w = w.reshape((-1, groupsize, n))
-        w = w.permute(1, 0, 2)
-        w = w.reshape((groupsize, -1))
-    s = torch.max(torch.abs(w), 0, keepdim=True)[0]
-    s *= 2 / maxq
-    w = torch.round(w / s).int()
-    w += (maxq + 1) // 2
-    w = torch.clamp(w, 0, maxq)
-    ref = (w - (maxq + 1) // 2).bfloat16() * s
+        w = w.reshape((-1, groupsize, n)) #-1 means it will automtically infer that dimension from the other dimensions
+        w = w.permute(1, 0, 2) #swaps the first 2 dimensions 
+        w = w.reshape((groupsize, -1)) #flattens out the last 2 dimensions (This makes each column = 1 group)
+    s = torch.max(torch.abs(w), 0, keepdim=True)[0] #get max value along each column(group) and return tensor of that
+    s *= 2 / maxq #if we did not do this all the quantized values would fall between 1 and -1. By multiplying by 2 / maxq here we can multiply by maxq / 2 on the quantized weights allowing them to go over the full range
+    w = torch.round(w / s).int() #effectively does (w / (initial scales)) * (maxq/2)) rounded to nearest int
+    w += (maxq + 1) // 2  #shifts the values up to make them unsigned version
+    w = torch.clamp(w, 0, maxq)   #ensures all value are withing proper range
+    ref = (w - (maxq + 1) // 2).bfloat16() * s  #back to signed version, converted to bfloat16 values, and multiplied by scale
     if groupsize != -1:
         def reshape(w):
             w = w.reshape((groupsize, -1, n))
             w = w.permute(1, 0, 2)
-            w = w.reshape((m, n)).contiguous()
+            w = w.reshape((m, n)).contiguous() #reshape back to mxn format and make contiguous in memory
             return w
         ref = reshape(ref)
         w = reshape(w)
