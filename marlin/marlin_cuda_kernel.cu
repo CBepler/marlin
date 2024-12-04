@@ -340,10 +340,10 @@ __global__ void Marlin(
   int s_gl_rd = s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) + s_sh_stride * slice_col + threadIdx.x;
   int s_sh_wr = threadIdx.x;
   int s_sh_rd;
-  // We use a different scale layout for grouped and column-wise quantization as we scale a `half2` tile in column-major
+  // We use a different scale layout for grouped and column-wise quantization as we scale a `bfloat162` tile in column-major
   // layout in the former and in row-major in the latter case.
   if (group_blocks != -1)
-    s_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) / 4;
+    s_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) / 8;
   else
     s_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) % 4;
   
