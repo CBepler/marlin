@@ -37,6 +37,15 @@ def mul(A, B, C, s, workspace, thread_k=-1, thread_n=-1, sms=-1, max_par=16):
 
 # Precompute permutations for Marlin weight and scale shuffling 
 # This function calculates the ordering of quantized elements that is most efficient for the later dequantization
+
+#This is my rework for int2 quantization. Here is the rundown. In dequant their are now 3 pairs of values seperating each pair pair that share a scale value.
+#xx xx xx 11 xx xx xx 11        (each x being 2 bit value seperator) (paired up in pairs that use same scale) (the ones are 1 example of pair pairs that share same scale)
+#The outer loop for perm now only goes up to 16 since it only needs to go through 4 columns now because the 16x16 tile is now split up into 4 block intead of 2 (because the seperators are now of 4 pairs). 
+#The rows touched remain the same and are unaffected.
+#Each block is now only 4 instead of 8 and there are 4 blocks instead of 2.
+#The j loop in perm now goes to 8 (was 4) because since the quantization takes up half the space we need twice as many tiles to satisfy the tensor cores
+#Scale perm now goes to 16 in the j loop since there are now 4 scales per "row". Now the 8 * 16 gives a full 16 scales to each of the 8 tiles.
+
 def _get_perms():
     perm = []
     for i in range(16):
