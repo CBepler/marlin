@@ -36,21 +36,21 @@ def mul(A, B, C, s, workspace, thread_k=-1, thread_n=-1, sms=-1, max_par=16):
 
 
 # Precompute permutations for Marlin weight and scale shuffling 
-
+# This function calculates the ordering of quantized elements that is most efficient for the later dequantization
 def _get_perms():
     perm = []
-    for i in range(32):
+    for i in range(16):
         perm1 = []
         col = i // 4
-        for block in [0, 1]:
+        for block in [0, 1, 2, 3]:
             for row in [
                 2 * (i % 4),
                 2 * (i % 4) + 1,
                 2 * (i % 4 + 4),
                 2 * (i % 4 + 4) + 1
             ]:
-                perm1.append(16 * row + col + 8 * block)
-        for j in range(4):
+                perm1.append(16 * row + col + 4 * block)
+        for j in range(8):
             perm.extend([p + 256 * j for p in perm1])
 
     perm = np.array(perm)
@@ -58,15 +58,14 @@ def _get_perms():
     perm = perm.reshape((-1, 16))[:, interleave].ravel()
     perm = torch.from_numpy(perm)
     scale_perm = []
-    for i in range(16):
-        scale_perm.extend([i + 16 * j for j in range(16)])
-    scale_perm_single = []
     for i in range(8):
-        scale_perm_single.extend([2 * i + j for j in [0, 1, 16, 17, 32, 33, 48, 49]])
+        scale_perm.extend([i + 4 * j for j in range(16)])
+    scale_perm_single = []
+    for i in range(2):
+        scale_perm_single.extend([2 * i + j for j in [0, 1, 4, 5,  8, 9, 12, 13, 16, 17, 20, 21, 24, 25, 28, 29]])
     return perm, scale_perm, scale_perm_single
 
 _perm, _scale_perm, _scale_perm_single = _get_perms()
-
 
 class Layer(nn.Module):
     """PyTorch compatible Marlin layer; 2-bit (symmetric grouped) linear layer without bias."""

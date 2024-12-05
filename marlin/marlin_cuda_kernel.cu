@@ -343,7 +343,7 @@ __global__ void Marlin(
   // We use a different scale layout for grouped and column-wise quantization as we scale a `bfloat162` tile in column-major
   // layout in the former and in row-major in the latter case.
   if (group_blocks != -1)
-    s_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) / 8;
+    s_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) / 4;
   else
     s_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) % 4;
   
@@ -468,11 +468,11 @@ __global__ void Marlin(
       // If there are no groups, we can just scale the final output once and can avoid doing so for each weight.
       if (group_blocks != -1){
         scale(frag_b0[0], frag_s[k % 2][j], 0);
-	scale(frag_b0[1], frag_s[k % 2][j +1], 0);
+	scale(frag_b0[1], frag_s[k % 2][j], 1);
       }
       FragB2 frag_b1 = dequant(b_quant_shift);
       if (group_blocks != -1){
-        scale(frag_b1[0], frag_s[k % 2][j], 1);
+        scale(frag_b1[0], frag_s[k % 2][j + 1], 0);
 	scale(frag_b1[1], frag_s[k % 2][j + 1], 1);
       }
       #pragma unroll
